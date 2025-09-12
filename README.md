@@ -75,8 +75,6 @@ idf.py flash monitor
 - Monitor log levels (reduce I-tag spam for production).
 - Calibrate ADC with ESP-IDF calibration APIs if precision required.
 
-## License
-Add a license (e.g., MIT) if distributing.
 
 ## Acknowledgments
 ESP-IDF framework, open solar position references.
