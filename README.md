@@ -63,12 +63,6 @@ idf.py flash monitor
 - Divider ratio: 4:1 (adjust in battery.c if hardware changes)
 - Thresholds configurable in config.h
 
-## Future Enhancements
-- Automatic dusk parking
-- Cloud / BLE telemetry
-- Over‑the‑air updates
-- Adaptive motor step sizing
-- Deep sleep scheduling
 
 ## Development Notes
 - Keep compute-heavy operations out of ISR context.
