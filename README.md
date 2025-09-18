@@ -43,6 +43,13 @@ User Interface:     LED=4, Button=25
 Power:              12V battery + solar panel charging
 ```
 
+## Wiring Diagram
+![Hardware Connections](WiringDiagram.png)
+
+*Complete wiring schematic showing ESP32-CAM connections to GPS, motor drivers, 
+SD card, and user interface components. Verify all pin assignments match the 
+definitions in main.c before assembly.*
+
 ### Component Specifications
 - **ESP32-CAM**: Main controller with built-in WiFi/Bluetooth (unused)
 - **MAX-M10S GPS**: u-blox GPS with I2C interface, ~3m accuracy
