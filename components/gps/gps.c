@@ -1,181 +1,211 @@
 #include "gps.h"
-#include "config.h"
+#include <string.h>
 #include "driver/i2c.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
-// I2C Configuration for SparkFun GPS-RTK Dead Reckoning Breakout
-#define I2C_SCL_PIN       GPIO_NUM_22    // Standard ESP32 I2C SCL (clock)
-#define I2C_SDA_PIN       GPIO_NUM_21    // Standard ESP32 I2C SDA (data)  
-#define GPS_I2C_ADDRESS   0x42           // Default u-blox GPS module address
-#define I2C_MASTER_NUM    I2C_NUM_1      // Use I2C port 1 (port 0 often used by system)
-#define I2C_MASTER_FREQ_HZ 400000        // 400kHz fast mode for GPS data throughput
+/*
+    ┌───────────────────────────────────────────────────────────────────────┐
+    │ Implementation notes                                                  │
+    │ - UBX transport: [B5 62] [CLS] [ID] [LEN_L LEN_H] [PAYLOAD...] CK_A CK_B
+    │ - Checksum is computed over CLS, ID, LEN, and PAYLOAD (not sync bytes).
+    │ - We poll NAV‑PVT (CLS=0x01, ID=0x07). Minimum payload length = 92 bytes.
+    │ - For simplicity we read a fixed buffer (128 bytes) and parse if present.
+    │ - If you want continuous streaming later, switch to a ring buffer + ISR. │
+    └───────────────────────────────────────────────────────────────────────┘
+*/
 
-// GPS Module Timing Constants
-#define GPS_COLD_START_TIMEOUT_SEC  60   // Maximum time to wait for cold start fix
-#define GPS_WARM_START_TIMEOUT_SEC  10   // Maximum time to wait for warm start fix  
-#define GPS_RETRY_INTERVAL_MS       1000 // Time between GPS read attempts
-#define GPS_MIN_SATELLITES          4    // Minimum satellites for reliable fix
-#define GPS_MAX_HDOP               5.0   // Maximum horizontal dilution of precision
+#define TAG "GPS"
 
-static const char *TAG = "GPS";
+// Set to 1 to print hex dumps of I2C reads (can be noisy at 1 Hz).
+#ifndef GPS_LOG_HEXDUMP
+#define GPS_LOG_HEXDUMP 0
+#endif
 
-// GPS State Tracking
-static int gps_read_attempts = 0;            // Count of read attempts since init
-static uint32_t last_successful_fix_time = 0; // Timestamp of last valid GPS fix
-static bool gps_module_responsive = false;   // True if module responding to I2C
-static gps_location_t last_valid_fix = {     // Most recent valid GPS data
-    .latitude = FALLBACK_LATITUDE,
-    .longitude = FALLBACK_LONGITUDE, 
-    .altitude = FALLBACK_ALTITUDE,
-    .valid = false
-};
+static gps_cfg_t  s_cfg;
+static gps_data_t s_last = {0};
 
-void gps_init(void) {
-    ESP_LOGI(TAG, "Initializing SparkFun GPS-RTK Dead Reckoning (MAX-M10S)");
-    
-    // Configure I2C master interface
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,  // Enable internal pull-ups
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,  // (eliminates external resistors)
-        .master.clk_speed = I2C_MASTER_FREQ_HZ
-    };
-    
-    // Apply I2C configuration
-    esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &i2c_conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure I2C parameters: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    // Install I2C driver with minimal buffer sizes (GPS uses polling, not buffering)
-    ret = i2c_driver_install(I2C_MASTER_NUM, i2c_conf.mode, 0, 0, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to install I2C driver: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ESP_LOGI(TAG, "I2C initialized - SCL: GPIO%d, SDA: GPIO%d, Freq: %d Hz", 
-             I2C_SCL_PIN, I2C_SDA_PIN, I2C_MASTER_FREQ_HZ);
-    
-    // Initialize state variables
-    gps_read_attempts = 0;
-    last_successful_fix_time = 0;
-    gps_module_responsive = false;
-    
-    // Test I2C communication with GPS module
-    uint8_t test_data;
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (GPS_I2C_ADDRESS << 1) | I2C_MASTER_READ, true);
-    i2c_master_read_byte(cmd, &test_data, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    
-    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
-    i2c_cmd_link_delete(cmd);
-    
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "GPS module detected at I2C address 0x%02X", GPS_I2C_ADDRESS);
-        gps_module_responsive = true;
-    } else {
-        ESP_LOGW(TAG, "GPS module not responding at I2C address 0x%02X: %s", 
-                 GPS_I2C_ADDRESS, esp_err_to_name(ret));
-        ESP_LOGW(TAG, "Check wiring: SDA->GPIO21, SCL->GPIO22, VCC->3.3V, GND->GND");
-    }
-    
-    ESP_LOGI(TAG, "GPS initialization complete");
-    ESP_LOGI(TAG, "Fallback coordinates: %.6f, %.6f (altitude: %.1fm)", 
-             FALLBACK_LATITUDE, FALLBACK_LONGITUDE, FALLBACK_ALTITUDE);
+/* ────────────────────────── UBX helpers ──────────────────────────────── */
+
+static void ubx_checksum(const uint8_t *data, size_t len, uint8_t *ck_a, uint8_t *ck_b){
+    uint8_t A = 0, B = 0;
+    for (size_t i = 0; i < len; ++i){ A += data[i]; B += A; }
+    if (ck_a) *ck_a = A;
+    if (ck_b) *ck_b = B;
 }
 
-bool gps_read_location(gps_location_t *out) {
-    if (!out) {
-        ESP_LOGE(TAG, "NULL output pointer provided");
+/*
+    Send a UBX frame (header + payload + checksum) over I2C.
+    - cls/id: UBX message class and id.
+    - payload/len: may be NULL/0 for empty payload messages (e.g., poll).
+*/
+static esp_err_t ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len) {
+    uint8_t hdr[6] = {0xB5, 0x62, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8)};
+    uint8_t ck_a=0, ck_b=0;
+    ubx_checksum(&hdr[2], 4, &ck_a, &ck_b);  // class..len
+    for (int i = 0; i < len; i++){ ck_a += payload ? payload[i] : 0; ck_b += ck_a; }
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (s_cfg.addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, hdr, sizeof(hdr), true);
+    if (len && payload) i2c_master_write(cmd, payload, len, true);
+    uint8_t cks[2] = {ck_a, ck_b};
+    i2c_master_write(cmd, cks, 2, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(s_cfg.i2c_port, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+
+    ESP_LOGD(TAG, "UBX send: cls=0x%02X id=0x%02X len=%u -> %s", cls, id, (unsigned)len,
+             (ret == ESP_OK ? "OK" : "FAIL"));
+    return ret;
+}
+
+/*
+    Parse a UBX NAV‑PVT buffer and fill 'g'.
+
+    Expectations:
+    - buf starts with sync and at least a complete NAV‑PVT frame (we read fixed 128 B).
+    - We verify length and checksum before extracting fields we care about.
+
+    Returns true on success, false on any check failing.
+*/
+static bool parse_nav_pvt(const uint8_t *buf, size_t n, gps_data_t *g) {
+    // 1) Basic header checks
+    if (n < 6 + 92 + 2) { ESP_LOGD(TAG, "NAV-PVT: buffer too short (%u)", (unsigned)n); return false; }
+    if (buf[0] != 0xB5 || buf[1] != 0x62 || buf[2] != 0x01 || buf[3] != 0x07) {
+        ESP_LOGD(TAG, "NAV-PVT: sync/cls/id mismatch");
         return false;
     }
-    
-    gps_read_attempts++;
-    
-    // Check if GPS module is responsive via I2C
-    if (!gps_module_responsive) {
-        ESP_LOGD(TAG, "GPS module not responsive - using fallback coordinates");
-        out->valid = false;
+
+    // 2) Length and checksum validation
+    uint16_t len = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+    if ((size_t)(len + 6 + 2) > n) {
+        ESP_LOGD(TAG, "NAV-PVT: declared len=%u exceeds buffer", (unsigned)len);
         return false;
     }
-    
-    /*
-     * DEVELOPER NOTE: This is currently a simulation for testing.
-     * 
-     * In production, this function should:
-     * 1. Read NMEA sentences from GPS via I2C
-     * 2. Parse GGA/RMC sentences for position data
-     * 3. Validate fix quality (satellites, HDOP, etc.)
-     * 4. Update last_valid_fix if data is good
-     * 
-     * SparkFun MAX-M10S provides:
-     * - UBX binary protocol (more efficient than NMEA)
-     * - Dead reckoning when GPS signals lost
-     * - High update rates (up to 25Hz)
-     */
-    
-    if (gps_read_attempts < 3) {
-        // Simulate GPS acquisition time (cold start scenario)
-        ESP_LOGD(TAG, "GPS acquiring satellites... (attempt %d/3)", gps_read_attempts);
-        out->valid = false;
+
+    const uint8_t *payload = &buf[6];
+    uint8_t ck_a=0, ck_b=0;
+    ubx_checksum(&buf[2], 4 + len, &ck_a, &ck_b);
+    uint8_t rx_a = buf[6 + len];
+    uint8_t rx_b = buf[6 + len + 1];
+    if (ck_a != rx_a || ck_b != rx_b) {
+        ESP_LOGW(TAG, "NAV-PVT: checksum fail (calc %02X %02X, rx %02X %02X)", ck_a, ck_b, rx_a, rx_b);
         return false;
     }
-    
-    // Simulate successful GPS fix after initial attempts
-    ESP_LOGI(TAG, "GPS fix acquired! Using fallback coordinates for simulation");
-    
-    // Update last known good position
-    last_valid_fix.latitude = FALLBACK_LATITUDE;
-    last_valid_fix.longitude = FALLBACK_LONGITUDE; 
-    last_valid_fix.altitude = FALLBACK_ALTITUDE;
-    last_valid_fix.valid = true;
-    last_successful_fix_time = xTaskGetTickCount();
-    
-    // Return current position
-    *out = last_valid_fix;
+
+    // 3) Extract fields (u‑blox M10 NAV‑PVT layout)
+    // Offsets below are within the payload region.
+    // [20] fixType, [23] numSV, [24] lon(1e-7 deg), [28] lat(1e-7 deg),
+    // [36] hMSL(mm), [60] gSpeed(mm/s), [64] headMot(1e-5 deg)
+    uint8_t  fixType = payload[20];
+    uint8_t  numSV   = payload[23];
+    int32_t  lon1e7  = *(int32_t*)&payload[24];
+    int32_t  lat1e7  = *(int32_t*)&payload[28];
+    int32_t  hMSLmm  = *(int32_t*)&payload[36];
+    int32_t  gSpeed  = *(int32_t*)&payload[60]; // mm/s
+    int32_t  headDeg = *(int32_t*)&payload[64]; // 1e-5 deg
+
+    g->fix_type          = fixType;
+    g->num_satellites    = numSV;
+
+    if (fixType < 2) {
+        g->valid = false;
+        ESP_LOGD(TAG, "NAV-PVT: no 2D/3D fix yet (fixType=%u, SV=%u)", fixType, numSV);
+        return false;
+    }
+
+    g->longitude         = lon1e7 / 1e7;
+    g->latitude          = lat1e7 / 1e7;
+    g->altitude_m        = hMSLmm / 1000.0;
+    g->ground_speed_mps  = gSpeed / 1000.0f;
+    g->heading_deg       = headDeg / 1e5f;
+    g->timestamp         = time(NULL);
+    g->valid             = true;
+
+    ESP_LOGD(TAG, "NAV-PVT OK: fix=%u SV=%u lat=%.7f lon=%.7f alt=%.1f v=%.2f head=%.1f",
+             g->fix_type, g->num_satellites, g->latitude, g->longitude,
+             g->altitude_m, g->ground_speed_mps, g->heading_deg);
     return true;
 }
 
-gps_location_t gps_get_active_or_fallback(void) {
-    gps_location_t current_pos;
-    
-    // Try to get fresh GPS data first
-    if (gps_read_location(&current_pos) && current_pos.valid) {
-        ESP_LOGD(TAG, "Returning fresh GPS coordinates");
-        return current_pos;
-    }
-    
-    // No fresh GPS data - check if we have previous valid fix
-    if (last_valid_fix.valid) {
-        uint32_t time_since_fix = xTaskGetTickCount() - last_successful_fix_time;
-        uint32_t age_seconds = time_since_fix * portTICK_PERIOD_MS / 1000;
-        
-        if (age_seconds < 3600) { // Less than 1 hour old
-            ESP_LOGD(TAG, "Using cached GPS fix (%lu seconds old)", age_seconds);
-            return last_valid_fix;
-        } else {
-            ESP_LOGW(TAG, "Cached GPS fix too old (%lu seconds) - using fallback", age_seconds);
-        }
-    }
-    
-    // No valid GPS data available - use fallback coordinates
-    ESP_LOGW(TAG, "No GPS fix available - using fallback coordinates");
-    ESP_LOGW(TAG, "Verify fallback coordinates are correct for your installation site");
-    
-    gps_location_t fallback = {
-        .latitude = FALLBACK_LATITUDE,
-        .longitude = FALLBACK_LONGITUDE,
-        .altitude = FALLBACK_ALTITUDE,
-        .valid = true  // Fallback coordinates are considered "valid" for tracking
+/* ────────────────────────── Public API ──────────────────────────────── */
+
+esp_err_t gps_init(const gps_cfg_t *cfg) {
+    s_cfg = *cfg;
+
+    // Optional: bump this module to DEBUG without changing global verbosity.
+    esp_log_level_set(TAG, ESP_LOG_DEBUG);
+
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = s_cfg.sda_io,
+        .scl_io_num = s_cfg.scl_io,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = s_cfg.clk_hz
     };
-    
-    return fallback;
+    ESP_ERROR_CHECK(i2c_param_config(s_cfg.i2c_port, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(s_cfg.i2c_port, conf.mode, 0, 0, 0));
+
+    // Configure measurement/navigation rate: 1 Hz
+    // UBX-CFG-RATE payload: measRate [ms], navRate [cycles], timeRef [0=UTC,1=GPS]
+    uint8_t cfg_rate[] = { 0xE8,0x03,  0x01,0x00,  0x01,0x00 }; // 1000ms, 1, GPS
+    esp_err_t r = ubx_send(0x06, 0x08, cfg_rate, sizeof(cfg_rate));
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "CFG-RATE send failed: %s", esp_err_to_name(r));
+    }
+
+    ESP_LOGI(TAG, "GPS init: I2C%d SDA=%d SCL=%d @%lu Hz, addr=0x%02X",
+             s_cfg.i2c_port, s_cfg.sda_io, s_cfg.scl_io, (unsigned long)s_cfg.clk_hz, s_cfg.addr);
+    return ESP_OK;
+}
+
+bool gps_poll_nav_pvt(gps_data_t *out) {
+    // Poll request: UBX-NAV-PVT (empty payload)
+    if (ubx_send(0x01, 0x07, NULL, 0) != ESP_OK) {
+        ESP_LOGD(TAG, "NAV-PVT poll send failed");
+        return false;
+    }
+
+    // Allow device time to prepare the response on the I2C FIFO
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Read a fixed-size buffer; parse_nav_pvt validates size/cksum/content
+    uint8_t buf[128] = {0};
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (s_cfg.addr << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, buf, sizeof(buf), I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(s_cfg.i2c_port, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "I2C read failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+#if GPS_LOG_HEXDUMP
+    ESP_LOG_BUFFER_HEXDUMP(TAG, buf, sizeof(buf), ESP_LOG_DEBUG);
+#endif
+
+    gps_data_t g = {0};
+    if (!parse_nav_pvt(buf, sizeof(buf), &g)) return false;
+
+    s_last = g;
+    if (out) *out = g;
+
+    // Keep this one at INFO so we see healthy fixes at runtime
+    ESP_LOGI(TAG, "Fix=%u SV=%u Lat=%.7f Lon=%.7f Alt=%.1fm V=%.2fm/s Head=%.1f",
+             g.fix_type, g.num_satellites, g.latitude, g.longitude,
+             g.altitude_m, g.ground_speed_mps, g.heading_deg);
+    return true;
+}
+
+bool gps_get_last(gps_data_t *out) {
+    if (!s_last.valid) return false;
+    if (out) *out = s_last;
+    return true;
 }

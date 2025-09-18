@@ -1,174 +1,400 @@
+/*
+ * Enhanced GPS-Based Solar Tracking System
+ * ESP32 + MAX-M10S GPS + Dual Linear Actuators
+ * Optimized for power efficiency and tracking accuracy
+ * 
+ * ┌───────────────────────────────────────────────────────────────────────┐
+ * │ System Architecture Overview                                          │
+ * │                                                                       │
+ * │ Hardware Stack:                                                       │
+ * │  ESP32-CAM + MAX-M10S GPS + MD20A Motor Drivers + 12V Linear Acts     │
+ * │  200mm stroke actuators @ 11.94 mm/s nominal speed                   │
+ * │  MicroSD logging + Status LED + Start/Calibrate button               │
+ * │                                                                       │
+ * │ Software Stack:                                                       │
+ * │  ├── Tracking Controller (main coordination, sleep management)       │
+ * │  ├── GPS Module (I2C, time sync, position acquisition)               │
+ * │  ├── Solar Calculator (NOAA algorithms, sunrise/sunset)              │
+ * │  ├── Motor Control (PWM + DIR, time-based positioning)               │
+ * │  ├── SD Logging (CSV data + human readable logs)                     │
+ * │  └── Status LED (visual feedback for remote monitoring)              │
+ * │                                                                       │
+ * │ Power Profile (12V battery):                                         │
+ * │  ├── Deep Sleep: ~10-50µA (RTC + wake timer only)                    │
+ * │  ├── Active Tracking: ~150-300mA (GPS + CPU + peripherals)          │
+ * │  ├── Motor Moves: ~500-1000mA (brief, 5-10s duration)               │
+ * │  └── Daily Average: ~20-40mA (depends on tracking frequency)         │
+ * │                                                                       │
+ * │ Deployment Workflow:                                                  │
+ * │  1. Flash firmware, install hardware, insert SD card                 │
+ * │  2. Power on, wait for GPS fix (LED_WAITING)                         │
+ * │  3. Manually align panel to sun, long-press button (calibration)     │
+ * │  4. Press start button to begin autonomous tracking                   │
+ * │  5. System operates independently with nightly homing cycles         │
+ * └───────────────────────────────────────────────────────────────────────┘
+ */
+
+#include <stdio.h>
+#include <math.h>
 #include <time.h>
-#include "esp_log.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"  
-
-#include "config.h"
-#include "types.h"
-#include "button.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
 #include "gps.h"
-#include "battery.h"
-#include "motor_control.h"
-#include "solar_calc.h"
+#include "motor.h"
+#include "sdlog.h"
 #include "tracking.h"
+#include "status_led.h"
+#include "button.h"
+#include "esp_sleep.h"
 
-static const char *TAG = "APP";
+#define TAG "APP"
 
-// LED configuration
-#define LED_PIN    2    // Built-in LED on ESP32 WROOM 32E
+/*
+    ┌───────────────────────────────────────────────────────────────────────┐
+    │ Hardware Configuration                                                │
+    │                                                                       │
+    │ Pin assignments optimized for ESP32-CAM board compatibility:         │
+    │  - Avoids GPIO 0,1,3 (UART/boot)                                     │
+    │  - Avoids GPIO 6-11 (flash)                                          │
+    │  - Works around GPIO 2,12,13,14,15 (SD card)                         │
+    │  - Uses available GPIO 18,19,25,26,27,32,33                          │
+    │                                                                       │
+    │ I2C Bus (GPS):                                                        │
+    │  - SDA=18, SCL=19: Safe pins with good drive strength                │
+    │  - 400kHz: Fast enough for GPS without EMI issues                    │
+    │  - GPS addr 0x42: MAX-M10S default I2C address                       │
+    │                                                                       │
+    │ Motor Control (PWM + DIR):                                           │
+    │  - Uses LEDC hardware PWM (5kHz, 13-bit resolution)                  │
+    │  - GPIO 32,33,26,27: High-current capable pins                       │
+    │  - DIR pins control MD20A driver direction (extend/retract)          │
+    │                                                                       │
+    │ SD Card (SPI Mode):                                                   │
+    │  - Standard ESP32-CAM pinout (MOSI=15, MISO=2, SCK=14, CS=13)        │
+    │  - GPIO 2 is boot strap: remove SD during firmware flashing          │
+    │  - GPIO 15 is boot strap: avoid pulling low during boot              │
+    │                                                                       │
+    │ User Interface:                                                       │
+    │  - Status LED: GPIO 4 (ESP32-CAM built-in flash LED)                 │
+    │  - Start Button: GPIO 25 (safe, available pin)                       │
+    │  - Wire: GPIO → momentary switch → GND, internal pull-up enabled      │
+    └───────────────────────────────────────────────────────────────────────┘
+*/
 
-// LED Status Patterns
-typedef enum {
-    LED_STATUS_STARTUP,     // 🔴 Fast blinking (250ms) - system initializing
-    LED_STATUS_WAITING,     // 🟢 Steady ON - waiting for start button press
-    LED_STATUS_TRACKING,    // 🔵 Slow blinking (2s) - actively tracking sun
-    LED_STATUS_ERROR,       // 🟠 Rapid blinking (100ms) - error condition
-    LED_STATUS_SLEEP        // ⚫ OFF - system entering sleep mode
-} led_status_t;
+// Hardware config (adjust pins to match your wiring)
+#define I2C_NUM        I2C_NUM_0
+#define I2C_SDA        18     // GPS I2C SDA (ESP32-CAM free pin)
+#define I2C_SCL        19     // GPS I2C SCL (ESP32-CAM free pin)
+#define GPS_ADDR       0x42   // MAX-M10S default I2C address
 
-static led_status_t current_led_status = LED_STATUS_STARTUP;
+#define MOTOR_AZ_PWM   32     // Azimuth actuator PWM (high current capable)
+#define MOTOR_AZ_DIR   33     // Azimuth actuator direction
+#define MOTOR_EL_PWM   26     // Elevation actuator PWM
+#define MOTOR_EL_DIR   27     // Elevation actuator direction
 
-// Initialize LED
-static void led_init(void)
-{
-    gpio_reset_pin(LED_PIN);
-    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_PIN, 0);
+// SD card (ESP32-CAM SPI mode defaults - don't change without hardware mod)
+#define SD_MOSI        15     // CMD/MOSI (boot strap pin)
+#define SD_MISO        2      // D0/MISO (boot strap pin; keep default pull)
+#define SD_SCLK        14     // CLK/SCK
+#define SD_CS          13     // D3/CS
 
-    ESP_LOGI(TAG, "LED initialized on GPIO%d", LED_PIN);
-}
+// User interface pins
+#define STATUS_LED_GPIO 4     // ESP32-CAM built-in flash LED (active high)
+#define START_BTN_GPIO 25     // Start/calibrate button (change if needed)
 
-// LED status task with different patterns
-static void led_status_task(void *arg)
-{
-    bool led_state = false;
-    uint32_t blink_delay = 250;  // Default to startup pattern
+/*
+    Calibration task: monitors button for long-press events.
     
-    ESP_LOGI(TAG, "LED status task started");
+    Calibration procedure:
+    1. Manually align panel to point directly at sun (visual confirmation)
+    2. Press and hold START button for 3+ seconds
+    3. System calculates and stores mount offset angles
+    4. Future tracking uses these offsets automatically
     
-    while (1) {
-        switch (current_led_status) {
-            case LED_STATUS_STARTUP:
-                // 🔴 Fast blinking (250ms) - system initializing
-                blink_delay = 250;
-                led_state = !led_state;
-                break;
-                
-            case LED_STATUS_WAITING:
-                // 🟢 Steady ON - waiting for start button press
-                led_state = true;  // Always on
-                blink_delay = 100;  // Check status frequently but don't change LED
-                break;
-                
-            case LED_STATUS_TRACKING:
-                // 🔵 Slow blinking (2s) - actively tracking sun
-                blink_delay = 2000;
-                led_state = !led_state;
-                break;
-                
-            case LED_STATUS_ERROR:
-                // 🟠 Rapid blinking (100ms) - error condition
-                blink_delay = 100;
-                led_state = !led_state;
-                break;
-                
-            case LED_STATUS_SLEEP:
-                // ⚫ OFF - system entering sleep mode
-                led_state = false;  // Always off
-                blink_delay = 1000;
-                break;
+    Task design:
+    - Low priority background task (doesn't interfere with tracking)
+    - Polls button every 200ms (responsive but not CPU intensive)
+    - Infinite loop (runs for entire system lifetime)
+    - Uses blocking button API to wait for long press events
+    
+    Safety considerations:
+    - Safe to trigger calibration anytime (overwrites previous offsets)
+    - Requires valid GPS fix (function fails gracefully if no GPS)
+    - SD logging provides record of calibration events for maintenance
+    
+    Installation workflow:
+    - Best done during sunny conditions with clear sky view
+    - Can be repeated if mount hardware is adjusted or relocated
+    - Calibration accuracy directly affects tracking performance
+*/
+static void calib_task(void *arg){
+    ESP_LOGI(TAG, "Calibration monitor task started");
+    ESP_LOGI(TAG, "Long-press START button (3s) to calibrate mount offsets");
+    
+    for(;;){
+        // Wait for long press event (3 second threshold, infinite timeout)
+        if (button_wait_for_long_press(3000, -1)){
+            ESP_LOGI(TAG, "=== CALIBRATION TRIGGER ===");
+            ESP_LOGI(TAG, "Long-press detected: starting mount offset calibration");
+            
+            // Visual feedback during calibration
+            status_led_set_mode(LED_STARTUP);  // Fast blink indicates calibration active
+            
+            sdlog_printf("Long-press detected: calibrate mount offsets");
+            tracking_calibrate_mount_offset_now();
+            
+            // Return to normal tracking indication
+            status_led_set_mode(LED_TRACKING);
+            
+            ESP_LOGI(TAG, "Calibration complete, resuming normal operation");
         }
         
-        // Update LED state
-        gpio_set_level(LED_PIN, led_state ? 1 : 0);
-        
-        // Wait for next update
-        vTaskDelay(pdMS_TO_TICKS(blink_delay));
+        // Brief yield to prevent task starvation
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
-// Function to change LED status with logging
-static void set_led_status(led_status_t status)
-{
-    current_led_status = status;
+/*
+    Main application entry point.
     
-    const char* status_descriptions[] = {
-        "🔴 Fast blinking - System initializing",
-        "🟢 Steady ON - Waiting for start button", 
-        "🔵 Slow blinking - Actively tracking sun",
-        "🟠 Rapid blinking - Error condition",
-        "⚫ OFF - System entering sleep mode"
+    Initialization sequence:
+    1. Status LED (immediate visual feedback)
+    2. NVS flash (persistent storage for settings)
+    3. SD card logging (capture all events from boot)
+    4. GPS subsystem (position and time reference)
+    5. Motor control (actuator interface)
+    6. User interface (button input)
+    7. Wake cause analysis (timer vs manual start)
+    8. Tracking system startup (main application logic)
+    
+    Error handling strategy:
+    - Critical failures (NVS, GPS, Motors): LED_ERROR and halt
+    - Optional failures (SD card): LED indication but continue operation
+    - User interaction: LED_WAITING until start button pressed
+    
+    Boot behavior:
+    - Cold boot: wait for user start button (LED_WAITING)
+    - Timer wake: automatic tracking start (scheduled sunrise)
+    - Error wake: attempt normal startup with error indication
+    
+    Memory management:
+    - Static allocation preferred for stability
+    - NVS handles persistent data automatically
+    - FreeRTOS tasks for concurrent operation
+*/
+void app_main(void){
+    ESP_LOGI(TAG, "=== SOLTRAC SOLAR TRACKER STARTING ===");
+    ESP_LOGI(TAG, "Firmware build: %s %s", __DATE__, __TIME__);
+    ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
+    
+    // Get wake cause early for startup decision logic
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    const char* wake_reason = "UNKNOWN";
+    switch(wake_cause){
+        case ESP_SLEEP_WAKEUP_TIMER:    wake_reason = "RTC_TIMER"; break;
+        case ESP_SLEEP_WAKEUP_EXT0:     wake_reason = "EXT0_GPIO"; break;
+        case ESP_SLEEP_WAKEUP_EXT1:     wake_reason = "EXT1_GPIO"; break;
+        case ESP_SLEEP_WAKEUP_TOUCHPAD: wake_reason = "TOUCHPAD"; break;
+        case ESP_SLEEP_WAKEUP_ULP:      wake_reason = "ULP"; break;
+        default:                        wake_reason = "POWER_ON"; break;
+    }
+    ESP_LOGI(TAG, "Wake cause: %s", wake_reason);
+
+    // === STATUS LED INITIALIZATION ===
+    // First priority: visual feedback for remote debugging
+    ESP_LOGI(TAG, "Initializing status LED on GPIO%d...", STATUS_LED_GPIO);
+    if (!status_led_init(STATUS_LED_GPIO, true)) {
+        ESP_LOGE(TAG, "Failed to initialize status LED - continuing anyway");
+    }
+    status_led_set_mode(LED_STARTUP);
+    ESP_LOGI(TAG, "Status LED: STARTUP pattern active");
+
+    // === NVS FLASH INITIALIZATION ===
+    // Critical: required for persistent settings and calibration data
+    ESP_LOGI(TAG, "Initializing NVS flash storage...");
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition full or version mismatch, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+        ESP_LOGI(TAG, "NVS flash erased and reinitialized");
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS initialization failed: %s", esp_err_to_name(ret));
+        status_led_set_mode(LED_ERROR);
+        ESP_LOGE(TAG, "System halted due to NVS failure");
+        while(1) vTaskDelay(pdMS_TO_TICKS(1000));  // Halt with error indication
+    }
+    ESP_LOGI(TAG, "NVS flash ready");
+
+    // === SD CARD LOGGING INITIALIZATION ===
+    // High priority: capture boot events and system state
+    ESP_LOGI(TAG, "Initializing SD card logging...");
+    sdlog_cfg_t sd_config = {
+        .mosi = SD_MOSI, .miso = SD_MISO, 
+        .sclk = SD_SCLK, .cs = SD_CS
     };
-    
-    ESP_LOGI(TAG, "LED Status: %s", status_descriptions[status]);
-}
+    if (sdlog_init(&sd_config)) {
+        ESP_LOGI(TAG, "SD card logging active");
+        sdlog_printf("=== SYSTEM BOOT ===");
+        sdlog_printf("Wake cause: %s", wake_reason);
+        sdlog_printf("Build: %s %s", __DATE__, __TIME__);
+    } else {
+        ESP_LOGW(TAG, "SD card initialization failed - continuing without logging");
+        status_led_set_mode(LED_ERROR); 
+        vTaskDelay(pdMS_TO_TICKS(2000));  // Brief error indication
+        status_led_set_mode(LED_STARTUP); // Continue startup
+    }
 
-static void wait_for_start_button(void) {
-    ESP_LOGI(TAG, "Ready for operation - press start button to begin tracking");
-    set_led_status(LED_STATUS_WAITING);
-    button_wait_for_start();
-}
-
-void app_main(void) {
-    ESP_LOGI(TAG, "=== SOLTRAC GPS SOLAR TRACKER ===");
-    
-    // Initialize LED first for immediate visual feedback
-    led_init();
-    
-    // Start LED status task
-    xTaskCreate(led_status_task, "led_status", 2048, NULL, 4, NULL);
-    
-    // Start with startup pattern
-    set_led_status(LED_STATUS_STARTUP);
-    
-    ESP_LOGI(TAG, "Initializing components...");
-    
-    // Initialize each component with potential error checking
-    esp_err_t ret = button_init();
+    // === GPS SUBSYSTEM INITIALIZATION ===
+    // Critical: required for position and time reference
+    ESP_LOGI(TAG, "Initializing GPS subsystem...");
+    gps_cfg_t gps_config = {
+        .i2c_port = I2C_NUM,
+        .sda_io = I2C_SDA,
+        .scl_io = I2C_SCL,
+        .clk_hz = 400000,      // 400kHz I2C: fast but reliable
+        .addr = GPS_ADDR       // MAX-M10S default address
+    };
+    ret = gps_init(&gps_config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ Button initialization failed!");
-        set_led_status(LED_STATUS_ERROR);
-        vTaskDelay(pdMS_TO_TICKS(5000));  // Show error for 5 seconds
-        return;
+        ESP_LOGE(TAG, "GPS initialization failed: %s", esp_err_to_name(ret));
+        status_led_set_mode(LED_ERROR);
+        sdlog_printf("GPS init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "System halted due to GPS failure");
+        while(1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    
-    gps_init();
-    battery_init();
-    motor_init();
-    tracking_init();
-    
-    // Check battery level before starting
-    if (!battery_is_ok()) {
-        float voltage = battery_read_voltage();
-        ESP_LOGW(TAG, "⚠️  Low battery voltage: %.2fV", voltage);
-        set_led_status(LED_STATUS_ERROR);
-        vTaskDelay(pdMS_TO_TICKS(10000));  // Show error for 10 seconds
-        set_led_status(LED_STATUS_SLEEP);
-        tracking_prepare_sleep();
-        return;
+    ESP_LOGI(TAG, "GPS subsystem ready");
+
+    // === MOTOR CONTROL INITIALIZATION ===
+    // Critical: required for panel positioning
+    ESP_LOGI(TAG, "Initializing motor control subsystem...");
+    motor_cfg_t motor_config = {
+        // PWM and direction pins
+        .az_pwm_pin = MOTOR_AZ_PWM, .az_dir_pin = MOTOR_AZ_DIR,
+        .el_pwm_pin = MOTOR_EL_PWM, .el_dir_pin = MOTOR_EL_DIR,
+        
+        // Actuator specifications (adjust to match your hardware)
+        .stroke_mm = 200.0,         // 200mm stroke linear actuators
+        .speed_mm_per_s = 11.938,   // Nominal speed at 12V (varies with load/voltage)
+        
+        // Panel range limits (adjust to match your mechanical design)
+        .max_az_deg = 270,          // Maximum azimuth range
+        .max_el_deg = 85,           // Maximum elevation (avoid zenith for stability)
+        .min_el_deg = 10            // Minimum elevation (avoid ground obstacles)
+    };
+    ret = motor_init(&motor_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Motor initialization failed: %s", esp_err_to_name(ret));
+        status_led_set_mode(LED_ERROR);
+        sdlog_printf("Motor init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "System halted due to motor failure");
+        while(1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    ESP_LOGI(TAG, "Motor control ready");
+
+    // === USER INTERFACE INITIALIZATION ===
+    ESP_LOGI(TAG, "Initializing user interface (button on GPIO%d)...", START_BTN_GPIO);
+    button_cfg_t button_config = {
+        .gpio = START_BTN_GPIO,
+        .active_low = true,         // Button pulls GPIO to GND when pressed
+        .pull_up = true,            // Enable internal pull-up resistor
+        .pull_down = false,         // Disable pull-down (conflicts with pull-up)
+        .debounce_ms = 50           // 50ms debounce for mechanical switch
+    };
+    ret = button_init(&button_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Button initialization failed: %s", esp_err_to_name(ret));
+        status_led_set_mode(LED_ERROR);
+        sdlog_printf("Button init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "System halted due to button failure");
+        while(1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGI(TAG, "User interface ready");
+
+    // === STARTUP DECISION LOGIC ===
+    bool auto_start = (wake_cause == ESP_SLEEP_WAKEUP_TIMER);
     
-    ESP_LOGI(TAG, "✅ All systems initialized successfully");
-    ESP_LOGI(TAG, "🔋 Battery OK - ready for tracking operations");
+    if (!auto_start) {
+        // Manual startup: wait for user interaction
+        ESP_LOGI(TAG, "=== WAITING FOR USER START ===");
+        ESP_LOGI(TAG, "System ready - press START button on GPIO%d to begin tracking", START_BTN_GPIO);
+        ESP_LOGI(TAG, "Or long-press START button (3s) to calibrate mount offsets");
+        
+        status_led_set_mode(LED_WAITING);
+        sdlog_printf("Waiting for START button on GPIO%d", START_BTN_GPIO);
+        
+        // Block until user presses start button
+        ESP_LOGI(TAG, "Waiting for button press...");
+        button_wait_for_press(-1);  // Infinite timeout
+        
+        sdlog_printf("START button pressed - beginning tracking operations");
+        ESP_LOGI(TAG, "START button pressed - beginning tracking operations");
+        
+    } else {
+        // Automatic startup: scheduled wake from deep sleep
+        ESP_LOGI(TAG, "=== AUTOMATIC STARTUP ===");
+        ESP_LOGI(TAG, "Woke from scheduled timer - starting tracking immediately");
+        sdlog_printf("Timer wake: auto-starting tracking operations");
+    }
+
+    // === TRACKING SYSTEM STARTUP ===
+    ESP_LOGI(TAG, "=== STARTING TRACKING SYSTEM ===");
+    ESP_LOGI(TAG, "Initializing main tracking controller...");
     
-    // Wait for user to press start button
-    wait_for_start_button();
+    tracking_start();  // Create and start main tracking task
+    status_led_set_mode(LED_TRACKING);
     
-    ESP_LOGI(TAG, "🌞 Starting solar tracking operations");
-    set_led_status(LED_STATUS_TRACKING);
+    ESP_LOGI(TAG, "Tracking system active");
+    sdlog_printf("Tracking system started");
+
+    // === CALIBRATION MONITOR STARTUP ===
+    ESP_LOGI(TAG, "Starting calibration monitor task...");
+    BaseType_t calib_ret = xTaskCreate(
+        calib_task,                 // Task function
+        "calibration_monitor",      // Task name
+        2048,                       // Stack size (2KB sufficient for button handling)
+        NULL,                       // Task parameters
+        4,                          // Priority (lower than tracking, higher than idle)
+        NULL                        // Task handle (not needed)
+    );
     
-    // Begin tracking operations
-    tracking_first_run();
-    tracking_loop();
+    if (calib_ret != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create calibration task - manual calibration unavailable");
+        sdlog_printf("Warning: calibration monitor task creation failed");
+    } else {
+        ESP_LOGI(TAG, "Calibration monitor active");
+    }
+
+    // === INITIALIZATION COMPLETE ===
+    ESP_LOGI(TAG, "=== SYSTEM INITIALIZATION COMPLETE ===");
+    ESP_LOGI(TAG, "Solar tracker is now operational");
+    ESP_LOGI(TAG, "LED patterns: STARTUP→WAITING→TRACKING→ERROR→SLEEP");
+    ESP_LOGI(TAG, "Button: short press = start, long press (3s) = calibrate");
+    ESP_LOGI(TAG, "Check SD card logs for detailed operation history");
     
-    // Prepare for sleep
-    ESP_LOGI(TAG, "🌙 Solar tracking complete - preparing for sleep");
-    set_led_status(LED_STATUS_SLEEP);
+    sdlog_printf("System initialization complete - entering autonomous operation");
     
-    // Give LED time to turn off before sleep
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    tracking_prepare_sleep();
+    /*
+        Main application task exits here - system continues running via:
+        - Tracking task (main control loop)
+        - Calibration task (user input monitoring)  
+        - LED task (status indication)
+        - GPS task (periodic data acquisition)
+        
+        The system will:
+        1. Track sun during daylight hours
+        2. Enter deep sleep at night  
+        3. Wake automatically before sunrise
+        4. Perform nightly homing for position reset
+        5. Log all operations to SD card
+        6. Respond to user calibration requests
+        
+        To monitor operation:
+        - LED patterns indicate system state
+        - SD card contains CSV data + human-readable logs
+        - Serial console shows detailed debug information
+        - NVS preserves state across power cycles
+    */
 }

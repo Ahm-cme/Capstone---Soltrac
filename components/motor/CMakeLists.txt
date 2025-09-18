@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "motor_control.c"
-    INCLUDE_DIRS "." "../../include"
-    REQUIRES driver freertos
+    SRCS "motor.c"
+    INCLUDE_DIRS "include"
+    REQUIRES driver
 )

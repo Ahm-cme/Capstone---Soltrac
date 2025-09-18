@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "button.c"
+    SRCS "status_led.c"
     INCLUDE_DIRS "include"
     REQUIRES driver freertos
 )
